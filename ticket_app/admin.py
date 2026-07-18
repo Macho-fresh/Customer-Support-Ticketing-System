@@ -3,3 +3,4 @@ from .models import *
 
 admin.site.register(Ticket)
 admin.site.register(AuditLog)
+admin.site.register(Comment)
