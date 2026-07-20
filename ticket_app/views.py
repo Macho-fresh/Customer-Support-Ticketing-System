@@ -12,6 +12,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.core.mail import send_mail
 from django.conf import settings
+from django.db import transaction
+from django.core.cache import cache
+from .tasks import *
 
 class CreateTicket(generics.GenericAPIView):
     serializer_class = TicketSerializer
@@ -21,41 +24,32 @@ class CreateTicket(generics.GenericAPIView):
         title = request.data.get('title')
         description = request.data.get('description')
         agent = User.objects.filter(role='Agent').annotate(open_tickets=Count('agent')).order_by('open_tickets').first()
-
-        ticket =  Ticket.objects.create(
-            customer = request.user,
-            title = title,
-            description = description,
-            agent = agent
-        )
-
-        AuditLog.objects.create(
-            ticket = ticket,
-            action = f'{request.user} created a ticket',
-            user = request.user
-        )
-        # add later: tell the agent that he or she has been assigned to this ticket
-        subject="Ticket Assignment"
-
-        message = (
-            f"Hello {ticket.agent.username}\n\n"
-            f"The ticket titled '{ticket.title}' has been assigned to you.\n"
-            "Please attend to it as soon as possible.\n\n"
-            "Regards,\n"
-            "Ticket Team"
-
-        )
-
-        from_email = settings.DEFAULT_FROM_EMAIL
-
-        recipient_list=[
-            ticket.agent.email
-        ]
-
-        fail_silently=False
         
-        send_mail(subject, message, from_email, recipient_list, fail_silently)
+        with transaction.atomic():
+            ticket =  Ticket.objects.create(
+                customer = request.user,
+                title = title,
+                description = description,
+                agent = agent
+            )
 
+            AuditLog.objects.create(
+                ticket = ticket,
+                action = f'{request.user} created a ticket assigned to {agent}',
+                user = request.user
+            )
+
+            cache.set(
+                f"ticket_{ticket.id}",
+                ticket,
+                timeout=300
+            )
+            create_ticket_email.delay(
+            ticket.agent.email,
+            ticket.agent.username,
+            ticket.title
+            )
+        
         serializer = TicketSerializer(ticket)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     
@@ -69,38 +63,33 @@ class UpdateTicket(generics.GenericAPIView):
 
         ticket =  Ticket.objects.get(id=id)
         ticket.title = title
-        ticket.description = description
-        ticket.save()
 
-        AuditLog.objects.create(
-            ticket = ticket,
-            action = f'{request.user} updated this ticket',
-            user = request.user
-        )
+        with transaction.atomic():
+            ticket.description = description
+            ticket.save()
+
+            AuditLog.objects.create(
+                ticket = ticket,
+                action = f'{request.user} updated this ticket',
+                user = request.user
+            )
+
+            cache.delete(
+                f"ticket_{ticket.id}"
+            )
+
+            cache.set(
+                f"ticket_{ticket.id}",
+                ticket,
+                timeout=300
+            )
         
-        # add later: tell the agent that the user updtated their ticket title and description
-
-        subject="Ticket Updated"
-
-        message = (
-            f"Hello {ticket.agent.username}\n\n"
-            f"The ticket titled '{ticket.title}' was just updated.\n"
-            "Please attend to it as soon as possible.\n\n"
-            "Regards,\n"
-            "Ticket Team"
-
-        )
-
-        from_email = settings.DEFAULT_FROM_EMAIL
-
-        recipient_list=[
-            ticket.agent.email
-        ]
-
-        fail_silently=False
-        
-        send_mail(subject, message, from_email, recipient_list, fail_silently)
-
+            create_updated_ticket(
+                ticket.agent.email,
+                ticket.agent.username,
+                ticket.title
+            )
+      
         serializer = TicketSerializer(ticket)
         return Response(serializer.data, status=status.HTTP_200_OK)  
 
@@ -110,35 +99,25 @@ class DeleteTicket(generics.GenericAPIView):
 
     def delete(self, request, id):
 
-        ticket = Ticket.objects.get(id=id).delete()
+        with transaction.atomic():
+            ticket = Ticket.objects.get(id=id).delete()
 
-        AuditLog.objects.create(
-            ticket = ticket,
-            action = f'{request.user} deleted this ticket',
-            user = request.user
-        )
+            AuditLog.objects.create(
+                ticket = ticket,
+                action = f'{request.user} deleted this ticket',
+                user = request.user
+            )
+
+            cache.delete(
+                f"ticket_{ticket.id}"
+            )
         
-        # add later: tell the agent that the user deleted their ticket 
-        subject="Ticket Deleted"
-
-        message=(
-            f"Hello {ticket.agent},"
-            f"The customer of ticket: {ticket.title} "
-            f"has been has deleted their ticket."
-
-            'Regards',
-            'Ticket Team'
-        )
-
-        from_email=settings.DEFAULT_FROM_EMAIL
-
-        recipient_list=[
-            ticket.customer.email
-        ]
-
-        fail_silently=False
-        send_mail(subject, message, from_email, recipient_list, fail_silently)
-
+            delete_ticket.delay(
+            ticket.agent.email,
+            ticket.agent.username,
+            ticket.title
+            ) 
+            
 
         return Response({
             'message': 'Ticket deleted successfully'
@@ -155,7 +134,20 @@ class ViewAllAgentTickets(generics.GenericAPIView):
 
     def post(self, request):
         tickets = Ticket.objects.filter(agent=request.user) 
-        serializer = TicketSerializer(tickets, many=True)  
+        serializer = TicketSerializer(tickets, many=True) 
+        cache_key = f"agent_tickets_{request.user.id}"
+
+        data = cache.get(cache_key)
+
+        if data:
+
+            return Response(data)
+        
+        cache.set(
+            cache_key,
+            serializer.data,
+            timeout=300
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 class ViewOneAgentTicket(generics.GenericAPIView):
@@ -164,7 +156,20 @@ class ViewOneAgentTicket(generics.GenericAPIView):
 
     def post(self, request, id):
         ticket = Ticket.objects.get(agent=request.user, id=id)  
-        serializer = TicketSerializer(ticket)  
+        serializer = TicketSerializer(ticket) 
+        cache_key = f"agent_ticket_{request.user.id}"
+
+        data = cache.get(cache_key)
+
+        if data:
+
+            return Response(data)
+        
+        cache.set(
+            cache_key,
+            serializer.data,
+            timeout=300
+        ) 
         return Response(serializer.data, status=status.HTTP_200_OK)
     
 class ChangeTicketStatus(generics.GenericAPIView):
@@ -176,15 +181,27 @@ class ChangeTicketStatus(generics.GenericAPIView):
         ticket = Ticket.objects.get(agent=request.user, id=id) 
         old_status = ticket.status
         if ticket: 
-            ticket.status = s
-            ticket.save()
+            with transaction.atomic():
+                ticket.status = s
+                ticket.save()
 
-            AuditLog.objects.create(
-                ticket = ticket,
-                action = f'{request.user} changed ticket status from {old_status} to {s}',
-                user = request.user
-            )
-            serializer = TicketSerializer(ticket)  
+                AuditLog.objects.create(
+                    ticket = ticket,
+                    action = f'{request.user} changed ticket status from {old_status} to {s}',
+                    user = request.user
+                )
+
+                
+            serializer = TicketSerializer(ticket) 
+            cache.delete(
+                f"ticket_{ticket.id}"
+                )
+
+            cache.set(
+            f"ticket_{ticket.id}",
+            serializer.data,
+            timeout=300
+            )  
             return Response(serializer.data, status=status.HTTP_200_OK)   
         return Response({
             'error': 'Youre not the agent assigned to this ticket'
@@ -196,16 +213,26 @@ class ChangeTicketPriority(generics.GenericAPIView):
 
     def patch(self, request, id):
         priority = request.data.get('priority')
-        ticket = Ticket.objects.get(agent=request.user, id=id)  
-        ticket.priority = priority
-        ticket.save()
+        ticket = Ticket.objects.get(agent=request.user, id=id)
+        with transaction.atomic():  
+            ticket.priority = priority
+            ticket.save()
 
-        AuditLog.objects.create(
-            ticket = ticket,
-            action = f'{request.user} changed ticket priority to {priority}',
-            user = request.user
-        )
-        serializer = TicketSerializer(ticket)  
+            AuditLog.objects.create(
+                ticket = ticket,
+                action = f'{request.user} changed ticket priority to {priority}',
+                user = request.user
+            )
+        serializer = TicketSerializer(ticket)
+        cache.delete(
+                f"ticket_{ticket.id}"
+                )
+
+        cache.set(
+        f"ticket_{ticket.id}",
+        serializer.data,
+        timeout=300
+        )   
         return Response(serializer.data, status=status.HTTP_200_OK)          
     
 class ViewUserTicket(generics.GenericAPIView):
@@ -215,6 +242,19 @@ class ViewUserTicket(generics.GenericAPIView):
     def post(self, request, id):
         ticket = Ticket.objects.get(customer=request.user, id=id)  
         serializer = TicketSerializer(ticket)  
+        cache_key = f"user_ticket_{request.user.id}"
+
+        data = cache.get(cache_key)
+
+        if data:
+
+            return Response(data)
+        
+        cache.set(
+            cache_key,
+            serializer.data,
+            timeout=300
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 class ViewAllUserTicket(generics.GenericAPIView):
@@ -224,4 +264,19 @@ class ViewAllUserTicket(generics.GenericAPIView):
     def post(self, request):
         ticket = Ticket.objects.filter(customer=request.user)  
         serializer = TicketSerializer(ticket, many=True)  
+        cache_key = f"user_tickets_{request.user.id}"
+
+        data = cache.get(cache_key)
+
+        if data:
+
+            return Response(data)
+        
+        cache.set(
+            cache_key,
+            serializer.data,
+            timeout=300
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)
+    
+# add statistics
