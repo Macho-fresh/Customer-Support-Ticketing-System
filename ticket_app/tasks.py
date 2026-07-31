@@ -4,6 +4,7 @@ from django.conf import settings
 
 @shared_task
 def create_ticket_email(email, username, title):
+    print("EMAIL TASK STARTED")
     subject="Ticket Assignment"
 
     message = (
@@ -22,8 +23,10 @@ def create_ticket_email(email, username, title):
     ]
 
     fail_silently=False
-    
+
     send_mail(subject, message, from_email, recipient_list, fail_silently)
+    print("EMAIL TASK FINISHED..")
+
 
 def create_updated_ticket(email, username, title):
     subject="Ticket Updated"
